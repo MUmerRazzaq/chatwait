@@ -1,0 +1,399 @@
+openapi: 3.1.0
+
+info:
+  title: ChatWait API
+  version: 1.0.0
+  description: |
+    Chatbot service with synchronous and streaming interaction modes.
+
+    **Architecture**: Three-layer design (UI/Agent/API) with strict boundaries.
+
+    **Features**:
+    - Synchronous request/response (/v1/chat/wait)
+    - Real-time SSE streaming (/v1/chat/streaming)
+    - Multi-turn conversation support (stateless)
+    - Token-level reconnection for streaming resilience
+    - RFC 7807 error responses
+    - URL path versioning for backward compatibility
+  contact:
+    name: ChatWait Team
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8000
+    description: Local development server
+  - url: https://api.chatwait.example.com
+    description: Production server (placeholder)
+
+tags:
+  - name: chat
+    description: Chat interaction endpoints
+  - name: health
+    description: Service health and monitoring
+
+paths:
+  /v1/chat/wait:
+    post:
+      tags: [chat]
+      summary: Synchronous chat interaction
+      description: |
+        Send a message and receive a complete response once fully generated.
+        Used for synchronous request/response style interactions.
+
+        **Performance**: <5s response time for messages up to 500 characters (SC-001).
+      operationId: chatWait
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+            examples:
+              simple:
+                summary: Simple question
+                value:
+                  message: "What is Python?"
+              multi-turn:
+                summary: Multi-turn conversation
+                value:
+                  message: "Can you explain more about its uses?"
+                  context:
+                    messages:
+                      - role: "user"
+                        content: "What is Python?"
+                        timestamp: "2025-10-28T10:00:00Z"
+                      - role: "assistant"
+                        content: "Python is a high-level programming language..."
+                        timestamp: "2025-10-28T10:00:02Z"
+      responses:
+        "200":
+          description: Successful response with complete generated message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatResponse"
+              example:
+                message:
+                  role: "assistant"
+                  content: "Python is a high-level programming language known for readability..."
+                  timestamp: "2025-10-28T10:00:05Z"
+                  id: "550e8400-e29b-41d4-a716-446655440000"
+                context:
+                  messages:
+                    - role: "user"
+                      content: "What is Python?"
+                      timestamp: "2025-10-28T10:00:03Z"
+                    - role: "assistant"
+                      content: "Python is a high-level programming language known for readability..."
+                      timestamp: "2025-10-28T10:00:05Z"
+                metadata:
+                  token_count: 87
+                  generation_time_ms: 1234
+        "400":
+          description: Bad request - validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              example:
+                type: "/errors/validation-error"
+                title: "Validation Error"
+                status: 400
+                detail: "The 'message' field is required and cannot be empty."
+                instance: "/v1/chat/wait"
+        "500":
+          description: Internal server error - generation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              example:
+                type: "/errors/generation-failed"
+                title: "Generation Failed"
+                status: 500
+                detail: "The AI model failed to generate a response. Please try again."
+                instance: "/v1/chat/wait"
+        "503":
+          description: Service unavailable - LLM service down
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              example:
+                type: "/errors/service-unavailable"
+                title: "Service Unavailable"
+                status: 503
+                detail: "The AI service is temporarily unavailable. Please retry in a moment."
+                instance: "/v1/chat/wait"
+
+  /v1/chat/streaming:
+    post:
+      tags: [chat]
+      summary: Streaming chat interaction
+      description: |
+        Send a message and receive response tokens incrementally via Server-Sent Events (SSE).
+
+        **Performance**: 
+        - <2s time-to-first-token (SC-002)
+        - <200ms between consecutive tokens (target: 100-150ms average)
+
+        **Reconnection**: Use `Last-Event-ID` header to resume from last received token.
+      operationId: chatStreaming
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: SSE stream established - tokens sent as events
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE event stream format:
+
+                  ```
+                  id: token_abc123_001
+                  event: token
+                  data: {"text": "Python", "sequence": 1}
+
+                  id: token_abc123_002
+                  event: token
+                  data: {"text": " is", "sequence": 2}
+
+                  id: token_abc123_final
+                  event: end
+                  data: {"total_tokens": 87, "generation_time_ms": 1234}
+                  ```
+              examples:
+                token_event:
+                  summary: Token event
+                  value: |
+                    id: token_abc123_001
+                    event: token
+                    data: {"text": "Python", "sequence": 1}
+                end_event:
+                  summary: End event
+                  value: |
+                    id: token_abc123_final
+                    event: end
+                    data: {"total_tokens": 87, "generation_time_ms": 1234}
+                error_event:
+                  summary: Error event
+                  value: |
+                    id: token_abc123_error
+                    event: error
+                    data: {"type": "/errors/generation-failed", "title": "Generation Failed", "status": 500, "detail": "...", "instance": "/v1/chat/streaming"}
+        "400":
+          description: Bad request - validation error (before stream starts)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "503":
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema:
+            type: string
+            pattern: "^token_[a-zA-Z0-9_]+$"
+          description: |
+            Last successfully received token ID for reconnection.
+            Server will resume streaming from the next token after this ID.
+
+            Format: `token_{request_id}_{sequence_number}`
+          example: "token_abc123_005"
+
+  /health:
+    get:
+      tags: [health]
+      summary: Health check endpoint
+      description: Returns service health status
+      operationId: healthCheck
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [healthy, degraded, unhealthy]
+                  version:
+                    type: string
+                  timestamp:
+                    type: string
+                    format: date-time
+              example:
+                status: "healthy"
+                version: "1.0.0"
+                timestamp: "2025-10-28T10:00:00Z"
+
+components:
+  schemas:
+    Message:
+      type: object
+      required: [role, content, timestamp]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant]
+          description: Message author role
+        content:
+          type: string
+          minLength: 1
+          maxLength: 5000
+          description: Message text content (1-5000 characters)
+        timestamp:
+          type: string
+          format: date-time
+          description: When message was created (ISO 8601 UTC)
+        id:
+          type: string
+          format: uuid
+          description: Unique message identifier (auto-generated if not provided)
+      example:
+        role: "assistant"
+        content: "Python is a high-level programming language..."
+        timestamp: "2025-10-28T10:00:05Z"
+        id: "550e8400-e29b-41d4-a716-446655440000"
+
+    ConversationContext:
+      type: object
+      required: [messages]
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/Message"
+          minItems: 1
+          maxItems: 100
+          description: Ordered conversation history (1-100 messages)
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Additional context metadata (JSON-serializable values)
+      example:
+        messages:
+          - role: "user"
+            content: "What is Python?"
+            timestamp: "2025-10-28T10:00:00Z"
+          - role: "assistant"
+            content: "Python is a programming language..."
+            timestamp: "2025-10-28T10:00:02Z"
+
+    ChatRequest:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          minLength: 1
+          maxLength: 5000
+          description: User's current message (1-5000 characters, non-empty)
+        context:
+          $ref: "#/components/schemas/ConversationContext"
+          description: Previous conversation history (optional)
+        request_id:
+          type: string
+          format: uuid
+          description: Idempotency key (optional, for future use)
+      example:
+        message: "What is Python?"
+        context:
+          messages:
+            - role: "user"
+              content: "Hello"
+              timestamp: "2025-10-28T09:59:00Z"
+
+    ChatResponse:
+      type: object
+      required: [message, context]
+      properties:
+        message:
+          $ref: "#/components/schemas/Message"
+          description: Generated response message (role must be 'assistant')
+        context:
+          $ref: "#/components/schemas/ConversationContext"
+          description: Updated conversation context including new message
+        metadata:
+          type: object
+          properties:
+            token_count:
+              type: integer
+              description: Number of tokens in generated response
+            generation_time_ms:
+              type: integer
+              description: Response generation time in milliseconds
+            model_used:
+              type: string
+              description: LLM model identifier
+          description: Response metadata (optional)
+      example:
+        message:
+          role: "assistant"
+          content: "Python is a high-level programming language..."
+          timestamp: "2025-10-28T10:00:05Z"
+        context:
+          messages:
+            - role: "user"
+              content: "What is Python?"
+              timestamp: "2025-10-28T10:00:03Z"
+            - role: "assistant"
+              content: "Python is a high-level programming language..."
+              timestamp: "2025-10-28T10:00:05Z"
+
+    ProblemDetails:
+      type: object
+      required: [type, title, status, detail, instance]
+      description: RFC 7807 Problem Details for HTTP APIs
+      properties:
+        type:
+          type: string
+          pattern: "^/errors/[a-z-]+$"
+          description: URI identifying error category
+          example: "/errors/validation-error"
+        title:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Short human-readable summary
+          example: "Validation Error"
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+          description: HTTP status code
+          example: 400
+        detail:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: Actionable explanation for fixing the error
+          example: "The 'message' field is required and cannot be empty."
+        instance:
+          type: string
+          pattern: '^/v\d+/.*$'
+          description: Request path where error occurred
+          example: "/v1/chat/wait"
+      example:
+        type: "/errors/validation-error"
+        title: "Validation Error"
+        status: 400
+        detail: "The 'message' field is required and cannot be empty."
+        instance: "/v1/chat/wait"
+
+  securitySchemes: {}
+  # Note: v1 has no authentication - future versions will add API key or OAuth2
